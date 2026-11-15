@@ -21,6 +21,7 @@ defmodule Postgrex.Query do
   """
 
   @type t :: %__MODULE__{
+          one_trip: boolean | nil,
           cache: :reference | :statement,
           ref: reference | nil,
           name: iodata,
@@ -36,6 +37,7 @@ defmodule Postgrex.Query do
         }
 
   defstruct [
+    :one_trip,
     :ref,
     :name,
     :statement,
@@ -65,6 +67,10 @@ defimpl DBConnection.Query, for: Postgrex.Query do
 
   def encode(%{types: nil} = query, _params, _) do
     raise ArgumentError, "query #{inspect(query)} has not been prepared"
+  end
+
+  def encode(%{one_trip: true} = query, params, opts) do
+    {encode(%{query | one_trip: nil}, params, opts), params}
   end
 
   def encode(query, params, _) do

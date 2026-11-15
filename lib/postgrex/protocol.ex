@@ -365,6 +365,19 @@ defmodule Postgrex.Protocol do
     handle_prepare(%Query{name: name, statement: statement}, opts, s)
   end
 
+  def handle_prepare(%Query{one_trip: true} = query, opts, s) do
+    # Prepare locally from the bootstrapped cache, so DBConnection still runs
+    # the encoder in the caller, with its normal exception semantics.
+    encoding_oids = Enum.map(query.param_oids, &if(&1 == 0, do: @text_type_oid, else: &1))
+
+    with true <- one_trip_results?(s, opts),
+         {:ok, prepared} <- describe_params(s, query, encoding_oids) do
+      {:ok, %{prepared | param_oids: query.param_oids, types: s.types}, s}
+    else
+      _ -> handle_prepare(%{query | one_trip: nil}, opts, s)
+    end
+  end
+
   def handle_prepare(%Query{name: ""} = query, opts, s) do
     prepare = Keyword.get(opts, :postgrex_prepare, false)
     status = new_status(opts, prepare: prepare)
@@ -431,6 +444,10 @@ defmodule Postgrex.Protocol do
           | {:error, %DBConnection.TransactionError{}, state}
           | {:disconnect, %RuntimeError{}, state}
           | {:disconnect | :disconnect_and_retry, %DBConnection.ConnectionError{}, state}
+  def handle_execute(%Query{one_trip: true} = query, {encoded, params}, opts, s) do
+    one_trip_send(s, new_status(opts), query, encoded, params, opts)
+  end
+
   def handle_execute(%Query{} = query, params, opts, s) do
     case Keyword.get(opts, :postgrex_copy, false) do
       true ->
@@ -2101,6 +2118,144 @@ defmodule Postgrex.Protocol do
 
   defp transaction_error(s, status) do
     {:error, DBConnection.TransactionError.exception(status), s}
+  end
+
+  # A Bind error can abort an existing transaction. Require a caller-declared
+  # result shape there, and reject text-only / unbootstrapped types BEFORE
+  # sending Execute. Idle queries can drain and safely retry without this.
+  defp one_trip_results?(s, opts) do
+    case Keyword.fetch(opts, :one_trip_result_oids) do
+      {:ok, oids} when is_list(oids) ->
+        case fetch_type_info(oids, s.types) do
+          {:ok, infos} -> Enum.all?(infos, fn {format, _} -> format == :binary end)
+          _ -> false
+        end
+
+      _ ->
+        s.postgres == :idle
+    end
+  end
+
+  defp one_trip_send(%{buffer: buffer} = s, status, query, encoded, params, opts) do
+    tail = [
+      msg_bind(
+        name_port: "",
+        name_stat: "",
+        param_formats: query.param_formats,
+        params: encoded,
+        result_formats: [:binary]
+      ),
+      msg_execute(name_port: "", max_rows: 0),
+      msg_close(type: :statement, name: ""),
+      msg_sync()
+    ]
+
+    msgs = parse_describe_comment_msgs(query, Keyword.get(opts, :comment), tail)
+
+    with :ok <- msg_send(%{s | buffer: nil}, msgs, buffer),
+         {:ok, s, buffer} <- recv_parse(s, status, buffer),
+         {:ok, po, ro, rm, columns, s, buffer} <- recv_describe(s, status, buffer) do
+      case describe(s, query, po, ro, rm, columns, buffer) do
+        {:ok, described, s, buffer} ->
+          if Enum.all?(described.result_formats, &(&1 == :binary)) do
+            one_trip_recv(s, status, described, buffer)
+          else
+            one_trip_fallback(s, status, query, params, opts, buffer)
+          end
+
+        # Execute is already on the wire. Drain raw messages before reloading
+        # types or retrying with the standard per-column formats.
+        {:reload, _, s, buffer} ->
+          one_trip_fallback(s, status, query, params, opts, buffer)
+
+        {:disconnect, _err, %{buffer: buffer} = s} ->
+          one_trip_fallback(s, status, query, params, opts, buffer)
+      end
+    else
+      {:error, %Postgrex.Error{} = err, s, buffer} ->
+        error_ready(s, status, %{err | query: query.statement}, buffer) |> maybe_disconnect()
+
+      {:disconnect, _, _} = disconnect ->
+        disconnect
+    end
+  end
+
+  defp one_trip_recv(s, status, query, buffer) do
+    with {:ok, s, buffer} <- recv_bind(s, status, buffer),
+         {:ok, result, s, buffer} <- recv_execute(s, status, query, buffer),
+         {:ok, s, buffer} <- recv_close(s, status, buffer),
+         {:ok, s} <- recv_ready(s, status, buffer) do
+      {:ok, query, result, s}
+    else
+      {:error, %Postgrex.Error{} = err, s, buffer} ->
+        error_ready(s, status, %{err | query: query.statement}, buffer) |> maybe_disconnect()
+
+      {:disconnect, _, _} = disconnect ->
+        disconnect
+    end
+  end
+
+  defp one_trip_fallback(s, status, query, params, opts, buffer) do
+    case one_trip_drain(s, status, buffer) do
+      {:ok, s} ->
+        one_trip_legacy(s, query, params, opts)
+
+      {:error, %Postgrex.Error{postgres: %{message: message}}, s} = error ->
+        if String.contains?(message, "no binary output function") do
+          one_trip_legacy(s, query, params, opts)
+        else
+          error
+        end
+
+      other ->
+        other
+    end
+  end
+
+  defp one_trip_drain(s, status, buffer) do
+    case msg_recv(s, :infinity, buffer) do
+      {:ok, msg_ready(status: postgres), buffer} ->
+        cond do
+          s.transactions == :naive or s.postgres == postgres ->
+            {:ok, %{s | postgres: postgres, buffer: buffer}}
+
+          s.postgres == :transaction and postgres == :error ->
+            {:ok, %{s | postgres: :error, buffer: buffer}}
+
+          true ->
+            sync_error(s, postgres, buffer)
+        end
+
+      {:ok, msg_error(fields: fields), buffer} ->
+        error_ready(s, status, Postgrex.Error.exception(postgres: fields), buffer)
+        |> maybe_disconnect()
+
+      {:ok, msg, buffer}
+      when elem(msg, 0) in [
+             :msg_bind_complete,
+             :msg_data_row,
+             :msg_command_complete,
+             :msg_close_complete,
+             :msg_empty_query
+           ] ->
+        one_trip_drain(s, status, buffer)
+
+      {:ok, msg, buffer} ->
+        s = handle_msg(s, status, msg)
+        one_trip_drain(s, status, buffer)
+
+      {:disconnect, _, _} = disconnect ->
+        disconnect
+    end
+  end
+
+  defp one_trip_legacy(s, query, params, opts) do
+    query = %{query | one_trip: nil}
+
+    with {:ok, query, s} <- handle_prepare(query, opts, s) do
+      encoded = Types.encode_params(params, query.param_types, query.types)
+      handle_execute_result(query, encoded, opts, s)
+    end
   end
 
   defp handle_prepare_execute(%Query{name: ""} = query, params, opts, s) do

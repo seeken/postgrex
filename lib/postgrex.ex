@@ -61,6 +61,10 @@ defmodule Postgrex do
 
   @type execute_option ::
           {:decode_mapper, (list -> term)}
+          | {:one_trip, boolean}
+          | {:param_oids, [non_neg_integer]}
+          | {:one_trip_retry_safe, boolean}
+          | {:one_trip_result_oids, [non_neg_integer]}
           | option
 
   @max_rows 500
@@ -277,6 +281,17 @@ defmodule Postgrex do
     decoding, (default: `fn x -> x end`);
     * `:mode` - set to `:savepoint` to use a savepoint to rollback to before the
     query on error, otherwise set to `:transaction` (default: `:transaction`);
+    * `:one_trip` - Experimental opt-in unnamed extended query pipeline.
+      Defaults to `false` (or the `:postgrex, :one_trip` application setting).
+      See the README for its deliberately narrow inference and retry contract.
+    * `:param_oids` - Explicit PostgreSQL parameter OIDs for the pipeline.
+      Must match the parameter count. OID 0 is accepted only for `nil`.
+    * `:one_trip_retry_safe` - Caller assertion that an explicitly typed
+      statement may safely execute twice when result decoders require fallback.
+      Required with `:param_oids`; otherwise the ordinary path is used.
+    * `:one_trip_result_oids` - Expected result OIDs. Required for pipelining
+      inside a transaction; text-only or missing cached decoders fall back
+      before Bind. The caller must keep this declaration in sync with SQL.
     * `:cache_statement` - Caches the query with the given name
     * `:query_type` - Either `:binary` or `:text`. If `:binary` then the
       extended query protocol is used. If `:text` then the simple protocol
@@ -336,7 +351,17 @@ defmodule Postgrex do
           error
       end
     else
-      query_prepare_execute(conn, %Query{name: "", statement: statement}, params, opts)
+      query = %Query{name: "", statement: statement}
+
+      case Postgrex.OneTrip.parameter_oids(statement, params, opts) do
+        {:ok, oids} ->
+          query = %{query | one_trip: true, param_oids: oids}
+
+          query_prepare_execute(conn, query, params, opts)
+
+        :fallback ->
+          query_prepare_execute(conn, query, params, opts)
+      end
     end
   end
 
