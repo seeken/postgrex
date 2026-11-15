@@ -444,6 +444,14 @@ defmodule Postgrex.Protocol do
           | {:error, %DBConnection.TransactionError{}, state}
           | {:disconnect, %RuntimeError{}, state}
           | {:disconnect | :disconnect_and_retry, %DBConnection.ConnectionError{}, state}
+  def handle_execute(%Postgrex.Pipeline{} = query, params, opts, %{postgres: :idle} = s) do
+    pipeline_send(s, new_status(opts), query, params)
+  end
+
+  def handle_execute(%Postgrex.Pipeline{} = query, _params, _opts, s) do
+    {:ok, query, :fallback, s}
+  end
+
   def handle_execute(%Query{one_trip: true} = query, {encoded, params}, opts, s) do
     one_trip_send(s, new_status(opts), query, encoded, params, opts)
   end
@@ -2118,6 +2126,138 @@ defmodule Postgrex.Protocol do
 
   defp transaction_error(s, status) do
     {:error, DBConnection.TransactionError.exception(status), s}
+  end
+
+  # Three independently delimited exchanges, one socket send. In particular,
+  # an opening error must not stop us draining the query and ROLLBACK replies.
+  defp pipeline_send(%{buffer: buffer} = s, status, query, params) do
+    msgs = [
+      msg_query(statement: query.opening),
+      msg_parse(
+        name: "",
+        statement: query.statement,
+        type_oids: List.duplicate(0, length(params))
+      ),
+      msg_bind(
+        name_port: "",
+        name_stat: "",
+        param_formats: [:text],
+        params: params,
+        result_formats: [:binary]
+      ),
+      msg_describe(type: :portal, name: ""),
+      msg_execute(name_port: "", max_rows: 0),
+      msg_sync(),
+      msg_query(statement: "ROLLBACK")
+    ]
+
+    with :ok <- msg_send(%{s | buffer: nil}, msgs, buffer),
+         {:ok, opening, s, buffer} <- pipeline_part(s, status, :opening, buffer),
+         {:ok, business, s, buffer} <- pipeline_part(s, status, :query, buffer),
+         {:ok, rollback, s, buffer} <- pipeline_part(s, status, :rollback, buffer) do
+      s = %{s | buffer: buffer}
+      result = pipeline_result(opening, business, rollback)
+
+      if s.postgres == :idle do
+        {:ok, query, result, s}
+      else
+        err =
+          case result do
+            {:error, stage, err} -> %Postgrex.PipelineError{stage: stage, error: err}
+            _ -> Postgrex.QueryError.exception("pipeline rollback did not leave connection idle")
+          end
+
+        {:disconnect, err, s}
+      end
+    end
+  end
+
+  defp pipeline_result({:error, err}, _, _), do: {:error, :opening, err}
+  defp pipeline_result(_, {:error, err}, _), do: {:error, :query, err}
+  defp pipeline_result(_, _, {:error, err}), do: {:error, :rollback, err}
+  defp pipeline_result(_, business, _), do: business
+
+  defp pipeline_part(s, status, part, buffer, result \\ :ok, query \\ nil, rows \\ []) do
+    case msg_recv(s, :infinity, buffer) do
+      {:ok, msg_ready(status: postgres), buffer} ->
+        allowed =
+          if part == :rollback, do: [:idle, :transaction, :error], else: [:transaction, :error]
+
+        if postgres in allowed do
+          {:ok, result, %{s | postgres: postgres}, buffer}
+        else
+          sync_error(s, postgres, buffer)
+        end
+
+      {:ok, msg_error(fields: fields), buffer} ->
+        err = %{Postgrex.Error.exception(postgres: fields) | connection_id: s.connection_id}
+        pipeline_part(s, status, part, buffer, {:error, err}, query, [])
+
+      {:ok, msg_row_desc(fields: fields), buffer} when part == :query ->
+        {oids, names, mods} = columns(fields)
+
+        case describe_result(s, %Query{name: ""}, oids, mods, names) do
+          {:ok, described} ->
+            if Enum.all?(described.result_formats, &(&1 == :binary)) do
+              pipeline_part(s, status, part, buffer, result, described, rows)
+            else
+              pipeline_part(s, status, part, buffer, {:fallback, :text_result}, nil, [])
+            end
+
+          _ ->
+            pipeline_part(s, status, part, buffer, {:fallback, :unknown_result}, nil, [])
+        end
+
+      {:ok, msg_data_row(values: values), buffer} when part == :query and not is_nil(query) ->
+        case pipeline_decode(values, query, rows, s.types) do
+          {:ok, rows} -> pipeline_part(s, status, part, buffer, result, query, rows)
+          :error -> pipeline_part(s, status, part, buffer, {:fallback, :decode}, nil, [])
+        end
+
+      {:ok, msg_command_complete(tag: tag), buffer} when part == :query and result == :ok ->
+        query = query || %Query{}
+        {result, s} = done(s, query, rows, tag)
+        pipeline_part(s, status, part, buffer, {:ok, result}, query, rows)
+
+      {:ok, msg, buffer}
+      when elem(msg, 0) in [
+             :msg_copy_in_response,
+             :msg_copy_both_response,
+             :msg_copy_out_response
+           ] ->
+        {:disconnect, Postgrex.QueryError.exception("COPY is not supported in a read pipeline"),
+         %{s | buffer: buffer}}
+
+      {:ok, msg, buffer}
+      when elem(msg, 0) in [
+             :msg_row_desc,
+             :msg_data_row,
+             :msg_command_complete,
+             :msg_parse_complete,
+             :msg_bind_complete,
+             :msg_no_data,
+             :msg_empty_query
+           ] ->
+        pipeline_part(s, status, part, buffer, result, query, rows)
+
+      {:ok, msg, buffer} ->
+        pipeline_part(handle_msg(s, status, msg), status, part, buffer, result, query, rows)
+
+      {:disconnect, _, _} = disconnect ->
+        disconnect
+    end
+  end
+
+  # Decode a complete DataRow while retaining the unread network buffer, so a
+  # custom decoder exception cannot strand either Sync or the ROLLBACK reply.
+  defp pipeline_decode(values, query, rows, types) do
+    frame = <<?D, byte_size(values) + 6::signed-32, length(query.columns)::16, values::binary, 0>>
+    {:ok, rows, <<0>>} = Types.decode_rows(frame, query.result_types, rows, types)
+    {:ok, rows}
+  rescue
+    _ -> :error
+  catch
+    _, _ -> :error
   end
 
   # A Bind error can abort an existing transaction. Require a caller-declared

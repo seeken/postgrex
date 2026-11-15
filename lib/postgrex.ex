@@ -329,6 +329,55 @@ defmodule Postgrex do
     end
   end
 
+  @doc """
+  Experimental single-send guarded read. The caller supplies a trusted opening
+  starting with BEGIN READ ONLY, without COMMIT/ROLLBACK or business SQL. The
+  connection must be idle. Sends opening, unnamed query and ROLLBACK together.
+
+  Returns `{:ok, result}`, `{:error, stage, error}` (opening/query/rollback), or
+  `{:fallback, reason}` after draining and rollback. Unsupported input returns
+  `:fallback` before sending. Transport failures disconnect and are not retried.
+  This API does not replay. READ ONLY does not establish replay safety; callers
+  must separately establish it before acting on a fallback response.
+
+  Params use unknown OIDs and text format. Binaries are declined unless
+  `text_binaries: true` asserts every binary is a PostgreSQL text input, never
+  bytea or a binary UUID. Other scalars use their ISO / decimal representations.
+  Caller-selected custom parameter codecs are bypassed by this experimental API.
+  Result codecs still come from the connection's active type module.
+  """
+  def pipeline_read(conn, opening, statement, params, opts \\ []) do
+    if opts[:mode] == :savepoint or opts[:postgrex_copy] == true or not is_nil(opts[:comment]) or
+         length(params) > 65_535 do
+      :fallback
+    else
+      do_pipeline_read(conn, opening, statement, params, opts)
+    end
+  end
+
+  defp do_pipeline_read(conn, opening, statement, params, opts) do
+    with {:ok, encoded} <- Postgrex.Pipeline.encode_params(params, opts) do
+      query = %Postgrex.Pipeline{opening: opening, statement: statement}
+
+      case DBConnection.execute(conn, query, encoded, opts) do
+        {:error, %Postgrex.PipelineError{stage: :query, error: %Postgrex.Error{} = error}} ->
+          {:error, :query, %{error | query: IO.iodata_to_binary(statement)}}
+
+        {:error, %Postgrex.PipelineError{stage: stage, error: error}} ->
+          {:error, stage, error}
+
+        {:ok, _, {:error, :query, %Postgrex.Error{} = error}} ->
+          {:error, :query, %{error | query: IO.iodata_to_binary(statement)}}
+
+        {:ok, _, result} ->
+          result
+
+        {:error, _} = error ->
+          error
+      end
+    end
+  end
+
   defp binary_query(conn, statement, params, opts) do
     name = Keyword.get(opts, :cache_statement)
 

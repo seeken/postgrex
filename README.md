@@ -265,3 +265,32 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
+
+### Experimental guarded read pipeline
+
+This fork adds `Postgrex.pipeline_read(conn, opening, sql, params, opts)` for a
+trusted caller-owned `BEGIN READ ONLY` opening, one unnamed extended statement,
+and `ROLLBACK`. All messages are sent together. It requires an idle connection;
+host transactions decline before sending. `sql` is always parsed as a single
+extended-protocol statement. Named query caching is not involved.
+
+Parse uses unknown parameter OIDs; Bind uses text input parameters and binary
+results. Integers, floats, Decimal, booleans, nil and ISO date/time values have
+text encoders. Arrays, maps, tuples, custom structs and ambiguous binaries
+return `:fallback` before sending. `text_binaries: true` explicitly asserts that
+all binary parameters are text input representations, never bytea or binary
+UUIDs. Custom parameter codecs are bypassed. Text and binary input codecs can
+accept different Elixir values, so this API is an explicit opt-in contract,
+not a transparent replacement for `query/4`.
+
+Successful results use the active connection's binary decoders, including custom
+JSONB decoders. Missing/text-only decoders or decoding exceptions return
+`{:fallback, reason}` **after draining and rollback**. There is no automatic
+replay. READ ONLY and ROLLBACK do not undo session advisory locks, prepared
+statements or external effects. Replaying requires a separate repeatability
+contract. Errors include their stage (`:opening`, `:query`, `:rollback`); opening
+errors take precedence. A failure to reach idle disconnects the connection.
+
+The API is explicit and has no application-wide switch that wraps arbitrary
+Postgrex commands in read-only transactions. Existing `query/4`, transactions,
+streams, COPY and the earlier `one_trip` option keep their own behavior.
