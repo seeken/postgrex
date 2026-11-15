@@ -141,6 +141,86 @@ Postgrex.start_link(prepare: :unnamed)
 
 [PgBouncer 1.21.0 release notes](https://www.pgbouncer.org/changelog.html#pgbouncer-121x)
 
+## Experimental one-trip unnamed queries
+
+This fork prototypes an opt-in extended query pipeline. The default is off.
+For a statement whose parameter types and repeatability you control:
+
+```elixir
+Postgrex.query(conn, "SELECT * FROM widgets WHERE id = $1", [42],
+  one_trip: true,
+  param_oids: [20],
+  one_trip_retry_safe: true
+)
+```
+
+`param_oids` must be the PostgreSQL types the application intends, not guesses
+from Elixir values. For an `int4` key use OID 23, not 20. Supplying OIDs can
+change overload resolution, casts, precision and overflow behavior compared
+with server inference. Explicit text (25) is not interchangeable with uuid
+(2950), jsonb (3802), enum, bytea or unknown literals. OID 0 is permitted only
+for `nil`; NULL is sent with its ordinary -1 length framing.
+
+`one_trip_retry_safe: true` asserts that repeating the whole statement has no
+observable effects. A SELECT can call volatile functions, advance sequences,
+or lock rows, so its spelling alone does not establish repeatability. Without
+this assertion, explicitly typed requests use the ordinary path. Do not use
+this assertion for writes or effectful SELECTs.
+
+Inside an existing transaction, also supply `one_trip_result_oids`, listing
+all expected output types in column order. Keep this declaration in sync with
+the SQL and schema. All these types must already have binary decoders in the
+connection's type cache; otherwise preparation falls back before sending Bind.
+For example, `SELECT id, status FROM widgets WHERE id = $1` with an int4 key
+and text status uses `param_oids: [23], one_trip_result_oids: [23, 25]`.
+This restriction avoids aborting a transaction on a speculative binary Bind
+error. Schema drift invalidating the declaration remains a caller contract
+violation; the prototype does not supply automatic savepoint protection.
+
+Without explicit parameter OIDs, inference accepts **only** a whole statement
+consisting of `SELECT $1::type, $2::type, ...`, in consecutive parameter order,
+with optional surrounding whitespace and a final semicolon. There are no
+FROM clauses, expressions, comments, aliases, functions or other SQL syntax.
+Every non-null value must map to exactly the cast type:
+
+| Elixir value | PostgreSQL type / OID | Accepted cast spellings |
+|---|---|---|
+| signed 64-bit integer | int8 / 20 | int8, bigint |
+| binary | text / 25 | text |
+| boolean | bool / 16 | bool, boolean |
+| float | float8 / 701 | float8, double precision |
+| Decimal | numeric / 1700 | numeric |
+| Date | date / 1082 | date |
+| NaiveDateTime | timestamp / 1114 | timestamp |
+| DateTime | timestamptz / 1184 | timestamptz |
+| nil | unknown / 0 | any of the above, plus int4, integer |
+
+All other inputs and SQL fall back. This includes integer arithmetic, integer
+parameters cast to int4, table comparisons, uuid/jsonb comparisons, arrays,
+composites, maps, atoms, time values and integers outside the int8 range.
+There is deliberately no general SQL inference. The accepted projections
+already force the same types on the server and are safe to repeat. Within a
+transaction the result declaration rule still applies.
+
+The pipeline sends Parse, Describe, Bind, Execute, Close and Sync in one
+socket send. Close retains ordinary unnamed statement cleanup. Bind requests
+binary for every result column before RowDescription arrives. Parameter
+encoders and result decoders come from this connection's bootstrapped type
+cache, including custom type modules. Unknown parameter types fall back before
+sending the pipeline. Unknown result types or text-only decoders cause the
+pipeline to drain raw replies through ReadyForQuery, then the ordinary path
+reloads types and selects its normal per-column formats. The repeatability
+contract is necessary because Execute may already have finished. A server
+error is drained and returned; only the specific missing binary output
+function error in this fallback is retried. Transaction declarations preflight
+known text-only/missing decoders instead of speculating on them.
+
+Named cache requests, explicit prepare/execute, streams, COPY and savepoint
+mode keep their existing paths. The application setting
+`config :postgrex, :one_trip, true` changes the query option's default for
+verification; explicit `one_trip: false` overrides it. Enabling it does not
+make ineligible SQL use the pipeline.
+
 ## Contributing
 
 To contribute you need to compile Postgrex from source and test it:
